@@ -1,0 +1,156 @@
+# Pipeline de CI/CD
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ─────────────── 1. VERIFICAÇÃO ESTÁTICA ───────────────
+  lint:
+    name: Lint e segurança do código
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Instalar ferramentas
+        run: pip install ruff bandit
+      - name: Ruff (estilo e erros)
+        run: ruff check .
+      - name: Bandit (vulnerabilidades no código)
+        run: bandit -r . -x ./tests,./.venv -ll
+
+  codeql:
+    name: Análise CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3
+
+  # ─────────────── 2. TESTES (VERIFICAÇÃO DINÂMICA) ───────────────
+  test:
+    name: Testes (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+      - name: Rodar testes com cobertura
+        run: pytest --cov=app --cov-report=xml --cov-report=term
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+
+  # ─────────────── 3. BUILD ───────────────
+  build:
+    name: Build e publicação da imagem Docker
+    runs-on: ubuntu-latest
+    needs: [test, codeql]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+  # ─────────────── 4. AMBIENTE 1: STAGING ───────────────
+  deploy-staging:
+    name: Deploy em Staging
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    steps:
+      - name: Disparar deploy
+        env:
+          DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$DEPLOY_HOOK" ]; then
+            curl -fsS -X POST "$DEPLOY_HOOK"
+          else
+            echo "Sem DEPLOY_HOOK_URL configurado: simulando deploy em STAGING"
+          fi
+
+  # Análise dinâmica de segurança (DAST) contra a app rodando em staging
+  dast:
+    name: OWASP ZAP (DAST) em Staging
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: ${{ vars.STAGING_URL != '' }}
+    steps:
+      - uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          allow_issue_writing: false
+          fail_action: false
+
+  # ─────────────── 5. AMBIENTE 2: PRODUÇÃO ───────────────
+  deploy-production:
+    name: Deploy em Produção
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, dast]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.deploy-staging.result == 'success' &&
+      (needs.dast.result == 'success' || needs.dast.result == 'skipped')
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - name: Disparar deploy
+        env:
+          DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$DEPLOY_HOOK" ]; then
+            curl -fsS -X POST "$DEPLOY_HOOK"
+          else
+            echo "Sem DEPLOY_HOOK_URL configurado: simulando deploy em PRODUÇÃO"
+          fi
